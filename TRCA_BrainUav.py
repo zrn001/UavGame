@@ -20,7 +20,6 @@ import numpy as np
 import socket
 import struct
 from typing import Tuple
-from pynput.keyboard import Key, KeyCode, Controller
 
 # 让 print 的中文/emoji 在 Windows GBK 终端也能正常输出，不再因编码崩溃
 try:
@@ -42,19 +41,6 @@ from sklearn.base import BaseEstimator, ClassifierMixin
 from utils.extract_events import extract_events, read_raw_bdf
 # ★ 从共享配置读取：坏导联、分类窗长（改配置只需改 config_channels.py）
 from config_channels import GOOD_CH_INDEX, STIM_INTERVAL, print_config
-
-
-# ============================================================================
-# UDP 地址配置（反馈发送目标）
-# ============================================================================
-
-# 反馈目标：无人机/界面接收分类结果的地址
-FEEDBACK_IP = '127.0.0.1'
-FEEDBACK_PORT = 7823
-
-# 回环控制目标：发给本进程，主程序收到后模拟键盘按键
-CTL_IP = '127.0.0.1'
-CTL_PORT = 9999
 
 
 # ============================================================================
@@ -229,10 +215,10 @@ class FeedbackWorker(ProcessWorker):
     """
 
     def __init__(self, model_path, stim_interval, event_map,
-                 srate, timeout, worker_name, ch_ind,
+                 srate, lsl_source_id, timeout, worker_name, ch_ind,
                  freq_list=None, trigger_ch_name=None,
-                 feedback_addr=(FEEDBACK_IP, FEEDBACK_PORT),
-                 ctl_addr=(CTL_IP, CTL_PORT)):
+                 ipFb='127.0.0.1', portFb=8888,
+                 ):
         """
         参数
         ----
@@ -245,10 +231,8 @@ class FeedbackWorker(ProcessWorker):
             事件标签映射（仅在 trigger_ch_name=None 时用于 annotations 提取）
         srate : int
             采样率，默认 1000Hz
-        feedback_addr : tuple, optional
-            UDP 反馈发送目标地址 (ip, port)，默认发给无人机/界面
-        ctl_addr : tuple, optional
-            UDP 回环控制目标地址 (ip, port)，主程序据此模拟键盘按键
+        lsl_source_id : str
+            LSL 数据源 ID
         timeout : float
             Worker 超时时间
         worker_name : str
@@ -262,10 +246,13 @@ class FeedbackWorker(ProcessWorker):
             BDF 触发通道名称（如 "Trigger/Status"）。
             None → 从文件标注提取；字符串 → 从命名通道解析
         """
+        self.ipFb = ipFb
+        self.portFb = portFb
         self.model_path = model_path
         self.stim_interval = stim_interval
         self.stim_labels = event_map
         self.srate = srate
+        self.lsl_source_id = lsl_source_id
         self.ch_ind = ch_ind
         # 刺激频率
         self.freq_list = freq_list if freq_list is not None else [8, 9, 10, 11, 12, 13]
@@ -275,12 +262,8 @@ class FeedbackWorker(ProcessWorker):
         self.model_config = None
         # 触发通道名称
         self.trigger_ch_name = trigger_ch_name
-        # UDP 反馈地址与回环控制地址（socket 在 pre() 中创建）
-        self.feedback_addr = feedback_addr
-        self.ctl_addr = ctl_addr
-        self.sock_feedback = None
-        self.sock_ctl = None
         super().__init__(timeout=timeout, name=worker_name)
+
     # ------------------------------------------------------------------
     # Epoch 切分
     # ------------------------------------------------------------------
@@ -397,9 +380,8 @@ class FeedbackWorker(ProcessWorker):
         # 避免每次 consume 都重新调用 iirnotch（消费端提速，减轻 CPU 抢占）。
         self._notch_b, self._notch_a = signal.iirnotch(50, 30, fs=self.srate)
 
-        # ---- Step 3: 建立 UDP 输出 socket（反馈 + 回环控制）----
-        self.sock_feedback = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock_ctl = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # ---- Step 3: 建立 Socket 输出流 ----
+        self.socket_fb = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         print('Connected. 在线分类就绪。')
 
     # ------------------------------------------------------------------
@@ -457,14 +439,10 @@ class FeedbackWorker(ProcessWorker):
             print(f"   历史预测: {len(self.pred_history)} 次 "
                   f"| 多数标签: {most_common} | 一致性: {consistency:.1%}")
 
-        # ---- Step 6: UDP 输出 ----
+        # ---- Step 6: Socket 输出 ----
         now = datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]
         msg = bytes(str(pred_label), encoding='utf-8')
-        # 发送给无人机/界面
-        self.sock_feedback.sendto(msg, self.feedback_addr)
-        # 回环发给主进程，用于键盘控制
-        self.sock_ctl.sendto(msg, self.ctl_addr)
-
+        self.socket_fb.sendto(msg, (self.ipFb, self.portFb))
         print("p_labels send done at {}".format(now))
         print("********************************************\r\n")
 
@@ -473,12 +451,11 @@ class FeedbackWorker(ProcessWorker):
     # ------------------------------------------------------------------
 
     def post(self):
-        """Worker 停止时调用，关闭 UDP socket"""
-        for sock in (self.sock_feedback, self.sock_ctl):
-            try:
-                sock.close()
-            except Exception:
-                pass
+        """Worker 停止时调用"""
+        try:
+            self.udp_sock.close()
+        except Exception:
+            pass
 
 
 # ============================================================================
@@ -528,7 +505,8 @@ if __name__ == '__main__':
     # "Trigger/Status" → 从 BDF 命名触发通道解析事件
     trigger_ch_name = None
 
-    # ======================== Worker 配置 ========================
+    # ======================== LSL 配置 ========================
+    lsl_source_id = 'meta_online_worker666'
     feedback_worker_name = 'feedback_worker'
 
     # ======================== 放大器配置 ========================
@@ -537,12 +515,12 @@ if __name__ == '__main__':
     amp_chans = 64           # 放大器在线传输的总通道数
 
     # ======================== 构建系统 ========================
-    # UDP 反馈 socket 由 FeedbackWorker 在 pre() 中自行创建，这里无需手动创建。
     worker = FeedbackWorker(
         model_path=model_path,
         stim_interval=stim_interval,
         event_map=event_map,
         srate=srate,
+        lsl_source_id=lsl_source_id,
         timeout=5e-2,
         worker_name=feedback_worker_name,
         ch_ind=ch_ind,
@@ -563,77 +541,10 @@ if __name__ == '__main__':
     time.sleep(0.5)
     ns.start_trans()
 
-    # ======================== 接收回环指令（用于键盘控制）============================
-    sock_ctl_recv = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock_ctl_recv.bind((CTL_IP, CTL_PORT))
-
-    '''
-    键盘按键相关操作----------------------------------------------------
-    '''
-    keyboard = Controller()
-
-    # 12 个指令 → 键盘按键 映射（先按此方案实现，后续可再调整）
-    # 0 TakeOff / 1 Land / 2 Forward / 3 Back / 4 Left / 5 Right
-    # 6 CW / 7 CCW / 8 Up / 9 Down / 10 Keep / 11 Hover
-    command_key = {
-        0:  Key.space,                 # TakeOff 起飞
-        1:  KeyCode.from_char('l'),    # Land 降落
-        2:  Key.up,                    # Forward 前进
-        3:  Key.down,                  # Back 后退
-        4:  Key.left,                  # Left 左移
-        5:  Key.right,                 # Right 右移
-        6:  KeyCode.from_char('d'),    # CW 顺时针旋转
-        7:  KeyCode.from_char('a'),    # CCW 逆时针旋转
-        8:  KeyCode.from_char('w'),    # Up 上升
-        9:  KeyCode.from_char('s'),    # Down 下降
-        10: KeyCode.from_char('k'),    # Keep 保持
-        11: KeyCode.from_char('h'),    # Hover 悬停
-    }
-
-    print("键盘控制已就绪，等待指令... (Ctrl+C 退出)")
-
-    CMD_KEEP = 10    # Keep：保持
-    CMD_HOVER = 11   # Hover：悬停（只松键）
-
-    current_key = None   # 当前正在按下的按键（收到下一条命令时才松开）
-    try:
-        while True:
-            recv_data = sock_ctl_recv.recvfrom(1024)
-            data = int(recv_data[0].decode('utf-8'))
-            print("指令：", data)
-
-            # Keep：保持当前按键不松开，也不按新键
-            if data == CMD_KEEP:
-                continue
-
-            # Hover：只松开当前按键，不按下新键
-            if data == CMD_HOVER:
-                if current_key is not None:
-                    keyboard.release(current_key)
-                    current_key = None
-                continue
-
-            key = command_key.get(data)
-            if key is None:
-                print("未知指令，忽略:", data)
-                continue
-
-            # 与当前按键相同则继续按住，不重复触发
-            if key == current_key:
-                continue
-
-            # 先松开上一个按键，再按下新按键
-            if current_key is not None:
-                keyboard.release(current_key)
-            keyboard.press(key)
-            current_key = key
-    except KeyboardInterrupt:
-        print("\n停止接收指令")
-        if current_key is not None:
-            keyboard.release(current_key)
-
-    ns.down_worker('feedback_worker')
-    time.sleep(1)
-    ns.stop_trans()
-    ns.clear()
-    print('bye')
+    # 保持运行，按任意键停止
+    # input('press any key to close\n')
+    # ns.down_worker('feedback_worker')
+    # time.sleep(1)
+    # ns.stop_trans()
+    # ns.clear()
+    # print('bye')
