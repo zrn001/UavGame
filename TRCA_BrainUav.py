@@ -592,27 +592,77 @@ if __name__ == '__main__':
 
     print("键盘控制已就绪，等待指令... (Ctrl+C 退出)")
 
-    CMD_KEEP = 10    # Keep：保持
-    CMD_HOVER = 11   # Hover：悬停（只松键）
+    CMD_TAKEOFF = 0   # TakeOff：起飞
+    CMD_LAND = 1      # Land：降落
+    CMD_KEEP = 10     # Keep：保持
+    CMD_HOVER = 11    # Hover：悬停（只松键）
 
     current_key = None   # 当前正在按下的按键（收到下一条命令时才松开）
+
+    cmd_index = 0        # 已收到指令总数（用于启动序列）
+    land_run = 0         # 连续收到 land 的次数
+    skip_after_land = 0  # land-land 后需要忽略的指令数
+
     try:
         while True:
             recv_data = sock_ctl_recv.recvfrom(1024)
             data = int(recv_data[0].decode('utf-8'))
             print("指令：", data)
 
-            # Keep：保持当前按键不松开，也不按新键
-            if data == CMD_KEEP:
+            cmd_index += 1
+
+            # ---- 启动序列：第 1 个指令强制按 TakeOff，紧跟的第 2、3 个指令忽略 ----
+            if cmd_index == 1:
+                # 无论收到什么指令，都强制按 takeoff（空格键）
+                if current_key is not None:
+                    keyboard.release(current_key)
+                keyboard.press(command_key[CMD_TAKEOFF])
+                current_key = command_key[CMD_TAKEOFF]
+                print("  → 启动序列：强制 TakeOff")
+                continue
+            if cmd_index in (2, 3):
+                print("  → 启动序列：忽略该指令")
                 continue
 
-            # Hover：只松开当前按键，不按下新键
+            # ---- Land-Land 按键后忽略后续两个指令 ----
+            if skip_after_land > 0:
+                skip_after_land -= 1
+                print(f"  → Land 后忽略该指令（还剩 {skip_after_land} 个）")
+                continue
+
+            # ---- Keep：保持当前按键不松开，也不按新键 ----
+            if data == CMD_KEEP:
+                land_run = 0   # 非 land，打断“连续 land”
+                continue
+
+            # ---- Hover：只松开当前按键，不按下新键 ----
             if data == CMD_HOVER:
+                land_run = 0   # 非 land，打断“连续 land”
                 if current_key is not None:
                     keyboard.release(current_key)
                     current_key = None
                 continue
 
+            # ---- Land 特殊处理：连续收到两个 land 才执行 ----
+            if data == CMD_LAND:
+                land_run += 1
+                if land_run == 1:
+                    # 第一个 land 不作处理，等待连续第二个 land
+                    print("  → 收到第 1 个 Land，忽略，等待第 2 个")
+                    continue
+                # 连续第二个 land：执行 land 按键，并忽略后续两个指令
+                if current_key != command_key[CMD_LAND]:
+                    if current_key is not None:
+                        keyboard.release(current_key)
+                    keyboard.press(command_key[CMD_LAND])
+                    current_key = command_key[CMD_LAND]
+                land_run = 0
+                skip_after_land = 2
+                print("  → 连续两个 Land，执行降落，并忽略后续 2 个指令")
+                continue
+
+            # ---- 其余指令：正常按键处理 ----
+            land_run = 0   # 非 land，打断“连续 land”
             key = command_key.get(data)
             if key is None:
                 print("未知指令，忽略:", data)
